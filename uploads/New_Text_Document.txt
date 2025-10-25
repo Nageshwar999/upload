@@ -1,0 +1,513 @@
+# train_stroke_cpu.py
+# Upgraded "Accuracy-Focused" training script (Version A)
+# Changes:
+# - More epochs, increased patience
+# - Stronger classifier heads
+# - Richer augmentation
+# - Class-weighted loss (computed per-fold from train split)
+# - Label smoothing
+# - Gradient clipping
+# - TTA during ensemble evaluation
+# - Ensemble weighting (resnet heavier)
+# - Slightly higher resolution (IMG_SIZE)
+# - Save logs and checkpoints as before
+# - Keeps device=cpu to match original environment
+
+import os, copy, random, glob, platform, time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    PLOTTING_AVAILABLE = True
+except Exception:
+    PLOTTING_AVAILABLE = False
+
+import cv2
+
+# -----------------------
+DATA_DIR        = "Brain_Data_Organised"
+OUT_DIR         = "outputs_stroke_cpu"
+NUM_FOLDS       = 3
+NUM_EPOCHS      = 30
+BATCH_SIZE      = 16
+IMG_SIZE        = 256
+LEARNING_RATE   = 2e-4
+WEIGHT_DECAY    = 1e-4
+EARLY_STOP_PATIENCE = 6
+SEED            = 42
+
+MODELS          = ["resnet18", "mobilenet_v3_large"]
+
+SKULL_STRIP     = True
+COLOR_JITTER    = True
+
+FREEZE_BACKBONE = False
+WARMUP_EPOCHS   = 0
+
+USE_PRETRAINED  = True
+PRETRAINED_OK   = None
+# -----------------------
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def get_num_workers():
+    if platform.system().lower() == "windows":
+        return 0
+    cores = os.cpu_count() or 2
+    return max(2, cores // 4)
+
+def save_confusion_matrix(cm, classes, out_png):
+    if not PLOTTING_AVAILABLE:
+        return
+    plt.figure(figsize=(4, 3))
+    df_cm = pd.DataFrame(cm, index=classes, columns=classes)
+    sns.heatmap(df_cm, annot=True, fmt="d", cmap="Blues")
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+def current_lr(optimizer):
+    return optimizer.param_groups[0]["lr"]
+
+def describe_split(indices, dataset, class_names, title=""):
+    labels = [dataset.samples[i][1] for i in indices]
+    counts = {class_names[c]: 0 for c in range(len(class_names))}
+    for y in labels:
+        counts[class_names[y]] += 1
+    print(f"{title} split counts:", counts)
+
+def cv2_clahe_rgb(img_bgr, clip_limit=2.0, tile_grid_size=(8,8)):
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    cl = clahe.apply(l)
+    lab = cv2.merge((cl, a, b))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+def adaptive_skull_strip(gray_img):
+    g = gray_img
+    if g.ndim != 2:
+        g = cv2.cvtColor(g, cv2.COLOR_RGB2GRAY)
+    border = np.concatenate([g[0,:], g[-1,:], g[:,0], g[:,-1]])
+    bg_mean = float(border.mean())
+    blur = cv2.GaussianBlur(g, (5,5), 0)
+    thr_src = cv2.bitwise_not(blur) if bg_mean > 127 else blur
+    _, th = cv2.threshold(thr_src, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = np.ones((5,5), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=2)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(th, connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_idx = 1 + int(np.argmax(areas))
+        mask = (labels == max_idx).astype(np.uint8) * 255
+    else:
+        mask = th
+    return mask
+
+class OpenCVPreprocess:
+    def __init__(self, use_clahe=True, skull_strip=False):
+        self.use_clahe = use_clahe
+        self.skull_strip = skull_strip
+    def __call__(self, pil_img):
+        img = np.array(pil_img)
+        if img.ndim == 2:
+            img = np.stack([img]*3, axis=-1)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if self.use_clahe:
+            img_bgr = cv2_clahe_rgb(img_bgr, clip_limit=2.0, tile_grid_size=(8,8))
+        if self.skull_strip:
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            mask = adaptive_skull_strip(gray)
+            img_bgr = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        return transforms.functional.to_pil_image(img_rgb)
+
+# -----------------------
+# Model builders with stronger classification heads
+# -----------------------
+def build_resnet18(num_classes, pretrained=True):
+    try:
+        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+    except Exception:
+        m = models.resnet18(pretrained=pretrained)
+    in_features = m.fc.in_features
+    # stronger head
+    m.fc = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(in_features, 512),
+        nn.ReLU(inplace=True),
+        nn.BatchNorm1d(512),
+        nn.Dropout(0.4),
+        nn.Linear(512, num_classes)
+    )
+    return m
+
+def build_mobilenet_v3_large(num_classes, pretrained=True):
+    try:
+        m = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None)
+    except Exception:
+        m = models.mobilenet_v3_large(pretrained=pretrained)
+    in_features = m.classifier[-1].in_features
+    # stronger head
+    m.classifier[-1] = nn.Linear(in_features, 512)
+    m.classifier.append(nn.ReLU(inplace=True))
+    m.classifier.append(nn.BatchNorm1d(512))
+    m.classifier.append(nn.Dropout(0.4))
+    m.classifier.append(nn.Linear(512, num_classes))
+    return m
+
+def get_model(model_name, num_classes=2, want_pretrained=True):
+    name = model_name.lower()
+    if name == "resnet18":
+        return build_resnet18(num_classes, pretrained=want_pretrained)
+    if name == "mobilenet_v3_large":
+        return build_mobilenet_v3_large(num_classes, pretrained=want_pretrained)
+    raise ValueError(f"Unknown model: {model_name}")
+
+def new_model(model_name, num_classes):
+    global PRETRAINED_OK
+    if not USE_PRETRAINED:
+        return get_model(model_name, num_classes, want_pretrained=False)
+    if PRETRAINED_OK is False:
+        return get_model(model_name, num_classes, want_pretrained=False)
+    try:
+        m = get_model(model_name, num_classes, want_pretrained=True)
+        if PRETRAINED_OK is None:
+            PRETRAINED_OK = True
+            print("✅ Pretrained weights: available (will use for this run).")
+        return m
+    except Exception as ex:
+        if PRETRAINED_OK is None:
+            PRETRAINED_OK = False
+            print("⚠️ Pretrained weights unavailable (offline or blocked). Falling back to random init for the rest of this run.")
+            print(f"   Details: {ex}")
+        return get_model(model_name, num_classes, want_pretrained=False)
+
+# -----------------------
+# Training / Evaluation functions
+# -----------------------
+def train_one_epoch(model, loader, criterion, optimizer, device="cpu", desc="train"):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for inputs, targets in pbar:
+        inputs = inputs.to(device); targets = targets.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item() * inputs.size(0)
+        _, preds = outputs.max(1)
+        correct += preds.eq(targets).sum().item()
+        total += inputs.size(0)
+        pbar.set_postfix(loss=round(total_loss/max(1,total), 4), acc=round(correct/max(1,total), 4))
+    return total_loss/total, correct/total
+
+@torch.no_grad()
+def evaluate(model, loader, device="cpu", desc="val"):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    all_probs, all_labels = [], []
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for inputs, targets in pbar:
+        inputs = inputs.to(device); targets = targets.to(device)
+        outputs = model(inputs)
+        probs = torch.softmax(outputs, dim=1)
+        loss = nn.functional.cross_entropy(outputs, targets, reduction='sum')
+        total_loss += loss.item()
+        _, preds = outputs.max(1)
+        correct += preds.eq(targets).sum().item()
+        total += inputs.size(0)
+        all_probs.append(probs.cpu().numpy())
+        all_labels.append(targets.cpu().numpy())
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    acc = correct/total
+    loss = total_loss/total
+    try:
+        auc = roc_auc_score(all_labels, all_probs[:, 1])
+    except Exception:
+        auc = float("nan")
+    return loss, acc, auc, all_probs, all_labels
+
+# -----------------------
+# Test-time augmentation helper: simple flips
+# -----------------------
+@torch.no_grad()
+def model_tta_predict(model, images, device="cpu"):
+    # images: tensor batch (B,C,H,W)
+    model.eval()
+    # original
+    probs_sum = torch.softmax(model(images.to(device)), dim=1)
+    # horizontal flip
+    imgs_h = torch.flip(images, dims=[3])  # flip width
+    probs_sum += torch.softmax(model(imgs_h.to(device)), dim=1)
+    # vertical flip (mild)
+    imgs_v = torch.flip(images, dims=[2])
+    probs_sum += torch.softmax(model(imgs_v.to(device)), dim=1)
+    # average
+    probs_avg = probs_sum / 3.0
+    return probs_avg.cpu().numpy()
+
+# -----------------------
+def main():
+    start_time = time.time()
+    assert os.path.isdir(DATA_DIR), f"data_dir not found: {DATA_DIR}"
+    out_dir = Path(OUT_DIR); out_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(SEED)
+    device = torch.device("cpu")
+    num_workers = get_num_workers()
+    persistent_ok = (num_workers > 0 and platform.system().lower() != "windows")
+
+    jitter = [] if not COLOR_JITTER else [transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.02)]
+    train_tfms = transforms.Compose([
+        OpenCVPreprocess(use_clahe=True, skull_strip=SKULL_STRIP),
+        transforms.Resize((IMG_SIZE + 32, IMG_SIZE + 32)),
+        transforms.RandomResizedCrop(IMG_SIZE, scale=(0.80, 1.0), ratio=(0.95, 1.05)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.15),
+        transforms.RandomRotation(degrees=10),
+        transforms.ColorJitter(0.08, 0.08, 0.02),
+        transforms.GaussianBlur(kernel_size=(3, 3)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    val_tfms = transforms.Compose([
+        OpenCVPreprocess(use_clahe=True, skull_strip=SKULL_STRIP),
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    base_dataset = datasets.ImageFolder(DATA_DIR, transform=val_tfms)
+    class_names = base_dataset.classes
+    print("Classes:", class_names)
+    n_classes = len(class_names)
+    targets = np.array([base_dataset.samples[i][1] for i in range(len(base_dataset))])
+    indices = np.arange(len(base_dataset))
+    describe_split(indices, base_dataset, class_names, title="FULL DATA")
+
+    skf = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+    per_fold_metrics = []
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(indices, targets), start=1):
+        print(f"\n========== Fold {fold_idx}/{NUM_FOLDS} ==========")
+        describe_split(train_idx, base_dataset, class_names, title="TRAIN")
+        describe_split(val_idx, base_dataset, class_names, title="VAL")
+
+        train_subset = Subset(datasets.ImageFolder(DATA_DIR, transform=train_tfms), train_idx)
+        val_subset   = Subset(datasets.ImageFolder(DATA_DIR, transform=val_tfms),   val_idx)
+
+        train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True,
+                                  num_workers=num_workers, pin_memory=False, persistent_workers=persistent_ok)
+        val_loader   = DataLoader(val_subset,   batch_size=BATCH_SIZE, shuffle=False,
+                                  num_workers=num_workers, pin_memory=False, persistent_workers=persistent_ok)
+
+        # compute class weights using only training split to avoid leakage
+        train_labels = [datasets.ImageFolder(DATA_DIR, transform=val_tfms).samples[i][1] for i in train_idx]
+        class_counts = np.bincount(train_labels, minlength=n_classes).astype(np.float32)
+        # invert frequency
+        class_weights = 1.0 / (class_counts + 1e-6)
+        class_weights = class_weights / class_weights.sum() * n_classes  # normalize (sum to n_classes)
+        weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
+
+        for model_name in MODELS:
+            print(f"\n--- Model: {model_name} (Fold {fold_idx}) ---")
+            model = new_model(model_name, n_classes).to(device)
+
+            if FREEZE_BACKBONE:
+                if hasattr(model, "fc"):
+                    for name, p in model.named_parameters():
+                        p.requires_grad = name.startswith("fc.")
+                elif hasattr(model, "classifier"):
+                    last_idx = len(model.classifier) - 1
+                    head_key = f"classifier.{last_idx}"
+                    for name, p in model.named_parameters():
+                        p.requires_grad = (head_key in name)
+
+            optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                    lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+            try:
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="max", factor=0.5, patience=3, verbose=True
+                )
+            except TypeError:
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode="max", factor=0.5, patience=3
+                )
+            # loss: weighted + label smoothing (if supported)
+            try:
+                criterion = nn.CrossEntropyLoss(weight=weights_tensor.to(device), label_smoothing=0.05)
+            except TypeError:
+                # older torch: fall back without label smoothing
+                criterion = nn.CrossEntropyLoss(weight=weights_tensor.to(device))
+
+            log_rows = []
+            best_acc = 0.0
+            best_state = None
+            patience_ctr = 0
+
+            for epoch in range(1, NUM_EPOCHS+1):
+                if FREEZE_BACKBONE and epoch == WARMUP_EPOCHS+1:
+                    for p in model.parameters():
+                        p.requires_grad = True
+                    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+                    try:
+                        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer, mode="max", factor=0.5, patience=3, verbose=True
+                        )
+                    except TypeError:
+                        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer, mode="max", factor=0.5, patience=3
+                        )
+
+                tr_loss, tr_acc = train_one_epoch(model, train_loader, criterion, optimizer, device=device, desc=f"train e{epoch}")
+                val_loss, val_acc, val_auc, _, _ = evaluate(model, val_loader, device=device, desc=f"val   e{epoch}")
+                scheduler.step(val_acc)
+
+                lr_now = current_lr(optimizer)
+                print(f"Epoch {epoch:02d} | lr={lr_now:.2e} | "
+                      f"train_loss={tr_loss:.4f} acc={tr_acc:.4f} || "
+                      f"val_loss={val_loss:.4f} acc={val_acc:.4f} auc={val_auc:.4f}")
+
+                log_rows.append({
+                    "fold": fold_idx, "model": model_name, "epoch": epoch,
+                    "lr": lr_now, "train_loss": tr_loss, "train_acc": tr_acc,
+                    "val_loss": val_loss, "val_acc": val_acc, "val_auc": val_auc
+                })
+
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    best_state = copy.deepcopy(model.state_dict())
+                    patience_ctr = 0
+                    ckpt_path = Path(OUT_DIR) / f"{model_name}_fold{fold_idx}_best.pth"
+                    torch.save({
+                        "model": model_name,
+                        "fold": fold_idx,
+                        "state_dict": best_state,
+                        "class_names": class_names,
+                        "img_size": IMG_SIZE,
+                        "skull_strip": SKULL_STRIP
+                    }, ckpt_path)
+                else:
+                    patience_ctr += 1
+                    if patience_ctr >= EARLY_STOP_PATIENCE:
+                        print("Early stopping.")
+                        break
+            df_log = pd.DataFrame(log_rows)
+            df_log.to_csv(Path(OUT_DIR) / f"training_log_{model_name}_fold{fold_idx}.csv", index=False)
+            print(f"Best val acc for {model_name} Fold {fold_idx}: {best_acc:.4f}")
+
+        # -----------------------
+        # Ensemble evaluation (with TTA and model weighting)
+        # -----------------------
+        print(f"\n>>> Ensemble evaluation (Fold {fold_idx})")
+        models_fold = []
+        model_names_loaded = []
+        for model_name in MODELS:
+            ckpt_path = Path(OUT_DIR) / f"{model_name}_fold{fold_idx}_best.pth"
+            if not ckpt_path.exists():
+                continue
+            ckpt = torch.load(ckpt_path, map_location=device)
+            m = get_model(ckpt["model"], num_classes=len(ckpt["class_names"]), want_pretrained=False).to(device)
+            m.load_state_dict(ckpt["state_dict"], strict=True)
+            m.eval()
+            models_fold.append(m)
+            model_names_loaded.append(ckpt["model"])
+
+        if len(models_fold) == 0:
+            print("No models found for ensemble on this fold. Skipping.")
+            continue
+
+        # ensemble weighting map: prioritize resnet
+        weight_map = { "resnet18": 0.7, "mobilenet_v3_large": 0.3 }
+        # if some model missing, normalize
+        present_weights = [weight_map.get(n, 0.0) for n in model_names_loaded]
+        if sum(present_weights) <= 0:
+            present_weights = [1.0 / len(present_weights)] * len(present_weights)
+        else:
+            present_weights = [w / sum(present_weights) for w in present_weights]
+
+        all_probs_ens, all_labels_ens = [], []
+        with torch.no_grad():
+            eval_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False,
+                                     num_workers=num_workers, pin_memory=False, persistent_workers=persistent_ok)
+            for inputs, targets_b in tqdm(eval_loader, desc="ensemble eval", leave=False):
+                inputs = inputs  # keep on cpu
+                # accumulate weighted probs across models (with TTA inside)
+                probs_sum = None
+                for m_idx, m in enumerate(models_fold):
+                    # use TTA predictor that averages a few transforms
+                    probs = torch.from_numpy(model_tta_predict(m, inputs, device=device))
+                    w = present_weights[m_idx]
+                    if probs_sum is None:
+                        probs_sum = w * probs
+                    else:
+                        probs_sum = probs_sum + w * probs
+                # final averaged probs across ensemble
+                all_probs_ens.append(probs_sum.numpy())
+                all_labels_ens.append(targets_b.numpy())
+
+        all_probs_ens = np.concatenate(all_probs_ens, axis=0)
+        all_labels_ens = np.concatenate(all_labels_ens, axis=0)
+        preds = all_probs_ens.argmax(axis=1)
+        ens_acc = (preds == all_labels_ens).mean()
+        try:
+            ens_auc = roc_auc_score(all_labels_ens, all_probs_ens[:,1])
+        except Exception:
+            ens_auc = float("nan")
+
+        print(f"FOLD {fold_idx} ENSEMBLE: acc={ens_acc:.4f} auc={ens_auc:.4f}")
+        print(classification_report(all_labels_ens, preds, target_names=class_names))
+
+        cm = confusion_matrix(all_labels_ens, preds)
+        fold_dir = Path(OUT_DIR) / f"fold_{fold_idx}"
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(cm, index=class_names, columns=class_names).to_csv(fold_dir / "confusion_matrix.csv")
+        if PLOTTING_AVAILABLE:
+            save_confusion_matrix(cm, class_names, str(fold_dir / "confusion_matrix.png"))
+        with open(fold_dir / "classification_report.txt", "w") as f:
+            f.write(classification_report(all_labels_ens, preds, target_names=class_names))
+        np.save(fold_dir / "ensemble_probs.npy", all_probs_ens)
+        np.save(fold_dir / "ensemble_labels.npy", all_labels_ens)
+
+        per_fold_metrics.append({
+            "fold": fold_idx,
+            "ensemble_acc": float(ens_acc),
+            "ensemble_auc": float(ens_auc)
+        })
+        pd.DataFrame(per_fold_metrics).to_csv(Path(OUT_DIR) / "per_fold_metrics.csv", index=False)
+
+    total_mins = (time.time() - start_time) / 60.0
+    print(f"\n✅ Training complete in {total_mins:.1f} min.")
+    print(f"Checkpoints & logs saved to: {Path(OUT_DIR).resolve()}")
+
+if __name__ == "__main__":
+    main()
